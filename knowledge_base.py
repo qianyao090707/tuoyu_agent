@@ -3,12 +3,12 @@ import jieba
 import pickle
 import hashlib
 import logging
-from typing import List, Optional
+from typing import List, Optional, Dict
+from collections import defaultdict
 
 from langchain_community.vectorstores import FAISS
 from langchain_community.embeddings import DashScopeEmbeddings
 from langchain_community.retrievers import BM25Retriever
-from langchain_classic.retrievers.ensemble import EnsembleRetriever
 from langchain_text_splitters import RecursiveCharacterTextSplitter
 from langchain_core.documents import Document
 from langchain_community.document_loaders import DirectoryLoader, Docx2txtLoader
@@ -23,7 +23,7 @@ logger = logging.getLogger(__name__)
 
 
 class KnowledgeBase:
-    """知识库：负责文档加载、切块、向量索引构建与双路召回检索"""
+    """知识库：文档加载、切块、向量索引构建 + 双路召回 + RRF精排"""
 
     def __init__(self, api_key: str):
         self.api_key = api_key
@@ -46,10 +46,12 @@ class KnowledgeBase:
             separators=["\n\n", "\n", "。", "！", "？", " ", ""]
         )
 
-        # 向量库与检索器
+        # 向量库与BM25检索器
         self.vector_store: Optional[FAISS] = None
         self.bm25_retriever: Optional[BM25Retriever] = None
-        self.ensemble_retriever: Optional[EnsembleRetriever] = None
+
+        # RRF 精排常量（工业界标准取值）
+        self.rrf_k = 60
 
         # 初始化：有索引则加载，无则构建
         self._init_index()
@@ -77,7 +79,7 @@ class KnowledgeBase:
         return split_docs
 
     def _get_dir_hash(self) -> str:
-        """计算文档目录哈希，用于判断是否需要重建索引"""
+        """计算文档目录哈希，判断是否需要重建索引"""
         hash_md5 = hashlib.md5()
         for root, _, files in os.walk(self.doc_dir):
             for file in sorted(files):
@@ -108,7 +110,6 @@ class KnowledgeBase:
                     bm25_path = os.path.join(self.index_dir, "bm25_retriever.pkl")
                     with open(bm25_path, "rb") as f:
                         self.bm25_retriever = pickle.load(f)
-                    self._build_ensemble_retriever()
                     logger.info("本地索引加载成功")
                     return
             except Exception as e:
@@ -119,7 +120,6 @@ class KnowledgeBase:
         docs = self._load_documents()
         self._build_vector_index(docs)
         self._build_bm25_retriever(docs)
-        self._build_ensemble_retriever()
         self._save_index(current_hash)
         logger.info("索引构建完成")
 
@@ -128,24 +128,12 @@ class KnowledgeBase:
         self.vector_store = FAISS.from_documents(docs, self.embeddings)
 
     def _build_bm25_retriever(self, docs: List[Document]):
-        """构建BM25关键词检索器"""
+        """构建BM25关键词检索器（召回量翻倍，给精排留候选池）"""
         # 中文分词预处理
         for doc in docs:
             doc.page_content = " ".join(jieba.lcut(doc.page_content))
         self.bm25_retriever = BM25Retriever.from_documents(docs)
-        # 新版设置召回数量
-        self.bm25_retriever.k = int(self.cfg["retrieve_k"])
-
-
-    def _build_ensemble_retriever(self):
-        """构建双路召回融合检索器（BM25 + 向量）"""
-        vector_retriever = self.vector_store.as_retriever(
-            search_kwargs={"k": int(self.cfg["retrieve_k"])}
-        )
-        self.ensemble_retriever = EnsembleRetriever(
-            retrievers=[self.bm25_retriever, vector_retriever],
-            weights=[0.5, 0.5]
-        )
+        self.bm25_retriever.k = int(self.cfg["retrieve_k"]) * 2
 
     def _save_index(self, doc_hash: str):
         """保存索引到本地"""
@@ -160,14 +148,45 @@ class KnowledgeBase:
         with open(hash_file, "w") as f:
             f.write(doc_hash)
 
+    def _rrf_rank(self, doc_lists: List[List[Document]]) -> List[Document]:
+        """
+        RRF（倒数排名融合）精排算法
+        公式：score = sum( 1 / (rrf_k + 排名) )
+        """
+        scores: Dict[str, float] = defaultdict(float)
+        doc_map: Dict[str, Document] = {}
+
+        for doc_list in doc_lists:
+            for rank, doc in enumerate(doc_list, start=1):
+                doc_id = doc.page_content
+                doc_map[doc_id] = doc
+                scores[doc_id] += 1.0 / (self.rrf_k + rank)
+
+        # 按分数降序排序
+        sorted_docs = sorted(scores.items(), key=lambda x: x[1], reverse=True)
+        return [doc_map[doc_id] for doc_id, _ in sorted_docs]
+
     def retrieve(self, query: str, top_k: int = 3) -> List[Document]:
-        """检索相关文档片段"""
-        if not self.ensemble_retriever:
+        """
+        双路召回 + RRF精排
+        1. BM25关键词召回 + 向量语义召回
+        2. RRF算法融合两路结果，输出精排后的 top_k
+        """
+        if not self.vector_store or not self.bm25_retriever:
             raise RuntimeError("知识库未初始化")
 
         # 查询分词，和BM25预处理对齐
         query_cut = " ".join(jieba.lcut(query))
-        # 新版API：用invoke替代get_relevant_documents
-        docs = self.ensemble_retriever.invoke(query_cut)
-        return docs[:top_k]
 
+        # 1. 两路分别召回（候选池翻倍）
+        bm25_docs = self.bm25_retriever.invoke(query_cut)
+        vector_retriever = self.vector_store.as_retriever(
+            search_kwargs={"k": int(self.cfg["retrieve_k"]) * 2}
+        )
+        vector_docs = vector_retriever.invoke(query)
+
+        # 2. RRF 精排融合
+        ranked_docs = self._rrf_rank([bm25_docs, vector_docs])
+
+        # 3. 返回最终 top_k
+        return ranked_docs[:top_k]
